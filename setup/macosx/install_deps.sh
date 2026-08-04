@@ -3,20 +3,52 @@
 set -x
 set -e
 
-lazarus_ver="2.0.8"
-fpc="fpc-3.0.4-macos-x86_64-laz-2"
-lazarus="LazarusIDE-2.0.8-macos-x86_64"
+lazarus_ver="2.2.6"
+fpc_ver="3.2.2"
+fpc="fpc-${fpc_ver}.intelarm64-macosx"
+lazarus="Lazarus-${lazarus_ver}-0-x86_64-macosx"
 sourceforge_base="https://downloads.sourceforge.net/project/lazarus/Lazarus%20macOS%20x86-64/Lazarus%20${lazarus_ver}"
 download_attempts=3
 download_timeout="${download_timeout:-600}"
 download_backoff=5
+fpc_mount=""
+fpc_mounted=0
+fpc_downloaded=0
 
 if [ -n "${sourceforge_mirror-}" ]; then
   mirror_string="&use_mirror=${sourceforge_mirror}"
 fi
 
+detach_disk_image() {
+  detach_device=$1
+  detach_attempt=1
+
+  sync
+  while ! hdiutil detach "$detach_device"; do
+    if [ "$detach_attempt" -ge 5 ]; then
+      echo "Failed to detach $detach_device after $detach_attempt attempts." >&2
+      return 1
+    fi
+
+    echo "Failed to detach $detach_device; retrying in 2 seconds." >&2
+    sleep 2
+    detach_attempt=$((detach_attempt + 1))
+  done
+}
+
 cleanup_downloads() {
-  rm -f "fpc.pkg.part" "lazarus.pkg.part"
+  if [ "$fpc_mounted" -eq 1 ]; then
+    if detach_disk_image "$fpc_mount" > /dev/null; then
+      fpc_mounted=0
+    fi
+  fi
+  if [ "$fpc_mounted" -eq 0 ] && [ -n "$fpc_mount" ]; then
+    rmdir "$fpc_mount" > /dev/null 2>&1 || true
+  fi
+  if [ "$fpc_mounted" -eq 0 ] && [ "$fpc_downloaded" -eq 1 ]; then
+    rm -f "fpc.dmg"
+  fi
+  rm -f "fpc.dmg.part" "lazarus.pkg.part"
 }
 
 trap cleanup_downloads EXIT
@@ -68,7 +100,7 @@ download_package() {
   download_url "$package_url" "$destination"
 }
 
-ppcx64_target="/usr/local/lib/fpc/3.0.4/ppcx64"
+ppcx64_target="/usr/local/lib/fpc/${fpc_ver}/ppcx64"
 ppcx64_link="/usr/local/bin/ppcx64"
 
 validate_ppcx64_link() {
@@ -94,20 +126,49 @@ validate_ppcx64_link() {
   return 0
 }
 
-if [ ! -x "$(command -v fpc 2>&1)" ]; then
-  validate_ppcx64_link
-  download_package "$fpc.pkg" "fpc.pkg"
-  sudo installer -pkg "fpc.pkg" -target /
-  if [ ! -e "$ppcx64_link" ] && [ ! -L "$ppcx64_link" ]; then
-    sudo ln -s "$ppcx64_target" "$ppcx64_link"
-  else
+if [ ! -x "$(command -v fpc 2>&1)" ] || [ "$(fpc -iV)" != "$fpc_ver" ] || [ ! -x "$ppcx64_target" ]; then
+  if [ -e "$ppcx64_link" ] && [ ! -L "$ppcx64_link" ]; then
     validate_ppcx64_link
   fi
-  rm "fpc.pkg"
+  download_package "$fpc.dmg" "fpc.dmg"
+  fpc_downloaded=1
+  fpc_mount="$(mktemp -d "${TMPDIR:-/tmp}/transgui-fpc.XXXXXX")"
+  hdiutil attach -nobrowse -readonly -mountpoint "$fpc_mount" "fpc.dmg"
+  fpc_mounted=1
+  fpc_pkg="$fpc_mount/fpc-${fpc_ver}-intelarm64-macosx.mpkg"
+  if [ ! -e "$fpc_pkg" ]; then
+    echo "No installer package found in fpc.dmg" >&2
+    exit 1
+  fi
+  sudo installer -pkg "$fpc_pkg" -target /
+  detach_disk_image "$fpc_mount"
+  fpc_mounted=0
+  rmdir "$fpc_mount"
+  fpc_mount=""
+  rm "fpc.dmg"
+  fpc_downloaded=0
 fi
 
-if [ ! -x "$(command -v lazbuild 2>&1)" ]; then
+if [ ! -x "$ppcx64_target" ]; then
+  echo "$ppcx64_target is missing or is not executable" >&2
+  exit 1
+fi
+if ! validate_ppcx64_link; then
+  if [ ! -L "$ppcx64_link" ]; then
+    exit 1
+  fi
+  sudo rm "$ppcx64_link"
+fi
+if [ ! -L "$ppcx64_link" ]; then
+  sudo ln -s "$ppcx64_target" "$ppcx64_link"
+fi
+validate_ppcx64_link
+
+if [ ! -x "$(command -v lazbuild 2>&1)" ] || [ "$(lazbuild -v)" != "$lazarus_ver" ]; then
   download_package "$lazarus.pkg" "lazarus.pkg"
   sudo installer -pkg "lazarus.pkg" -target /
   rm "lazarus.pkg"
 fi
+
+test "$(fpc -iV)" = "$fpc_ver"
+test "$(lazbuild -v)" = "$lazarus_ver"
